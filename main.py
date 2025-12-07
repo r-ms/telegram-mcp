@@ -32,6 +32,8 @@ from telethon.tl.types import (
     InputPeerUser,
     InputPeerChat,
     InputPeerChannel,
+    InputPeerEmpty,
+    InputMessagesFilterEmpty,
 )
 import re
 from functools import wraps
@@ -56,21 +58,71 @@ def json_serializer(obj):
 
 load_dotenv()
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
+# Configuration state tracking
+_config_error: Optional[str] = None
+client: Optional[TelegramClient] = None
 
-# Check if a string session exists in environment, otherwise use file-based session
+# Validate required credentials
+_api_id_raw = os.getenv("TELEGRAM_API_ID")
+_api_hash_raw = os.getenv("TELEGRAM_API_HASH")
+
+if not _api_id_raw or not _api_hash_raw:
+    missing = []
+    if not _api_id_raw:
+        missing.append("TELEGRAM_API_ID")
+    if not _api_hash_raw:
+        missing.append("TELEGRAM_API_HASH")
+    _config_error = (
+        f"Telegram credentials not configured. Missing: {', '.join(missing)}. "
+        "Get credentials at https://my.telegram.org/apps and add them to your .env file."
+    )
+    print(f"WARNING: {_config_error}", file=sys.stderr)
+    TELEGRAM_API_ID = None
+    TELEGRAM_API_HASH = None
+else:
+    try:
+        TELEGRAM_API_ID = int(_api_id_raw)
+        TELEGRAM_API_HASH = _api_hash_raw
+    except ValueError:
+        _config_error = f"TELEGRAM_API_ID must be an integer, got: {_api_id_raw}"
+        print(f"WARNING: {_config_error}", file=sys.stderr)
+        TELEGRAM_API_ID = None
+        TELEGRAM_API_HASH = None
+
+TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+
+# Only check session if credentials are valid
+if _config_error is None and not SESSION_STRING and not TELEGRAM_SESSION_NAME:
+    _config_error = (
+        "No Telegram session configured. Run 'uv run session_string_generator.py' "
+        "to generate a TELEGRAM_SESSION_STRING for your .env file."
+    )
+    print(f"WARNING: {_config_error}", file=sys.stderr)
 
 mcp = FastMCP("telegram")
 
-if SESSION_STRING:
-    # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-else:
-    # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+# Only create client if configuration is valid
+if _config_error is None:
+    if SESSION_STRING:
+        client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    else:
+        client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+
+def require_client(func):
+    """Decorator to check if client is configured before running a tool."""
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        if _config_error is not None:
+            return {"error": _config_error, "configured": False}
+        if client is None:
+            return {"error": "Telegram client not initialized", "configured": False}
+        return await func(*args, **kwargs)
+
+    return wrapper
+
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -146,6 +198,14 @@ def log_and_format_error(
     Returns:
         A user-friendly error message with an error code.
     """
+    # Check if error is due to missing client configuration
+    if _config_error is not None:
+        error_str = str(error)
+        if isinstance(error, (AttributeError, TypeError)) and (
+            "NoneType" in error_str or client is None
+        ):
+            return f"Configuration error: {_config_error}"
+
     # Generate a consistent error code
     if isinstance(prefix, str) and prefix == "VALIDATION-001":
         # Special case for validation errors
@@ -315,6 +375,35 @@ def get_sender_name(message) -> str:
         return full_name if full_name else "Unknown"
     else:
         return "Unknown"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_status() -> dict:
+    """
+    Get the current configuration and connection status of the Telegram MCP server.
+    Use this tool to check if the server is properly configured and connected.
+    """
+    status = {
+        "configured": _config_error is None,
+        "connected": False,
+        "error": _config_error,
+    }
+
+    if client is not None:
+        try:
+            status["connected"] = client.is_connected()
+            if status["connected"]:
+                me = await client.get_me()
+                status["user"] = {
+                    "id": me.id,
+                    "username": me.username,
+                    "first_name": me.first_name,
+                    "phone": me.phone,
+                }
+        except Exception as e:
+            status["connection_error"] = str(e)
+
+    return status
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
@@ -662,13 +751,14 @@ async def get_contact_ids() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
-@validate_id("chat_id")
+@validate_id("chat_id", "from_user")
 async def list_messages(
     chat_id: Union[int, str],
     limit: int = 20,
     search_query: str = None,
     from_date: str = None,
     to_date: str = None,
+    from_user: Union[int, str] = None,
 ) -> str:
     """
     Retrieve messages with optional filters.
@@ -679,6 +769,7 @@ async def list_messages(
         search_query: Filter messages containing this text.
         from_date: Filter messages starting from this date (format: YYYY-MM-DD).
         to_date: Filter messages until this date (format: YYYY-MM-DD).
+        from_user: Filter messages from a specific user (user ID or @username).
     """
     try:
         entity = await client.get_entity(chat_id)
@@ -718,8 +809,18 @@ async def list_messages(
             except ValueError:
                 return f"Invalid to_date format. Use YYYY-MM-DD."
 
+        # Resolve from_user entity if provided
+        from_user_entity = None
+        if from_user:
+            try:
+                from_user_entity = await client.get_entity(from_user)
+            except Exception:
+                return f"Could not find user: {from_user}"
+
         # Prepare filter parameters
         params = {}
+        if from_user_entity:
+            params["from_user"] = from_user_entity
         if search_query:
             # IMPORTANT: Do not combine offset_date with search.
             # Use server-side search alone, then enforce date bounds client-side.
@@ -742,7 +843,7 @@ async def list_messages(
                 if from_date_obj:
                     # Walk forward from start date (oldest -> newest)
                     async for msg in client.iter_messages(
-                        entity, offset_date=from_date_obj, reverse=True
+                        entity, offset_date=from_date_obj, reverse=True, **params
                     ):
                         if to_date_obj and msg.date > to_date_obj:
                             break
@@ -757,6 +858,7 @@ async def list_messages(
                         # offset_date is exclusive; +1µs makes to_date inclusive
                         entity,
                         offset_date=to_date_obj + timedelta(microseconds=1),
+                        **params,
                     ):
                         messages.append(msg)
                         if len(messages) >= limit:
@@ -782,6 +884,123 @@ async def list_messages(
         return "\n".join(lines)
     except Exception as e:
         return log_and_format_error("list_messages", e, chat_id=chat_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+async def search_global_messages(
+    query: str,
+    min_date: str = None,
+    max_date: str = None,
+    chat_type: str = None,
+    limit: int = 100,
+) -> str:
+    """
+    Search messages globally across all chats.
+
+    Args:
+        query: The search query text.
+        min_date: Filter messages starting from this date (format: YYYY-MM-DD).
+        max_date: Filter messages until this date (format: YYYY-MM-DD).
+        chat_type: Filter by chat type: "groups", "channels", or "users".
+        limit: Maximum number of messages to retrieve (default: 100).
+    """
+    try:
+        # Parse date filters
+        min_date_ts = None
+        max_date_ts = None
+
+        if min_date:
+            try:
+                min_date_obj = datetime.strptime(min_date, "%Y-%m-%d")
+                min_date_ts = int(min_date_obj.timestamp())
+            except ValueError:
+                return "Invalid min_date format. Use YYYY-MM-DD."
+
+        if max_date:
+            try:
+                max_date_obj = datetime.strptime(max_date, "%Y-%m-%d")
+                # Set to end of day
+                max_date_obj = max_date_obj + timedelta(days=1, microseconds=-1)
+                max_date_ts = int(max_date_obj.timestamp())
+            except ValueError:
+                return "Invalid max_date format. Use YYYY-MM-DD."
+
+        # Determine chat type flags
+        groups_only = chat_type == "groups"
+        broadcasts_only = chat_type == "channels"
+        users_only = chat_type == "users"
+
+        # Perform global search using SearchGlobalRequest
+        result = await client(
+            functions.messages.SearchGlobalRequest(
+                q=query,
+                filter=InputMessagesFilterEmpty(),
+                min_date=min_date_ts or 0,
+                max_date=max_date_ts or 0,
+                offset_rate=0,
+                offset_peer=InputPeerEmpty(),
+                offset_id=0,
+                limit=limit,
+                folder_id=None,
+                groups_only=groups_only if groups_only else None,
+                broadcasts_only=broadcasts_only if broadcasts_only else None,
+            )
+        )
+
+        if not result.messages:
+            return "No messages found matching the search criteria."
+
+        # Build a map of chats and users for sender/chat names
+        chats_map = {c.id: c for c in result.chats}
+        users_map = {u.id: u for u in result.users}
+
+        lines = []
+        for msg in result.messages:
+            # Get chat info
+            chat_id = msg.peer_id
+            chat_name = "Unknown Chat"
+            if hasattr(chat_id, "channel_id"):
+                chat_entity = chats_map.get(chat_id.channel_id)
+                if chat_entity:
+                    chat_name = getattr(chat_entity, "title", "Unknown Channel")
+            elif hasattr(chat_id, "chat_id"):
+                chat_entity = chats_map.get(chat_id.chat_id)
+                if chat_entity:
+                    chat_name = getattr(chat_entity, "title", "Unknown Group")
+            elif hasattr(chat_id, "user_id"):
+                user_entity = users_map.get(chat_id.user_id)
+                if user_entity:
+                    chat_name = (
+                        f"{getattr(user_entity, 'first_name', '')} {getattr(user_entity, 'last_name', '')}".strip()
+                        or "Unknown User"
+                    )
+
+            # Get sender info
+            sender_name = "Unknown"
+            if msg.from_id:
+                if hasattr(msg.from_id, "user_id"):
+                    sender = users_map.get(msg.from_id.user_id)
+                    if sender:
+                        sender_name = (
+                            f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip()
+                            or "Unknown"
+                        )
+                elif hasattr(msg.from_id, "channel_id"):
+                    sender = chats_map.get(msg.from_id.channel_id)
+                    if sender:
+                        sender_name = getattr(sender, "title", "Unknown Channel")
+
+            message_text = msg.message or "[Media/No text]"
+            date_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "Unknown"
+
+            lines.append(
+                f'[{date_str}] Chat: "{chat_name}" | From: {sender_name}\n'
+                f"Message: {message_text}\n"
+            )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return log_and_format_error("search_global_messages", e, query=query)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
@@ -930,6 +1149,116 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
         return "\n".join(results)
     except Exception as e:
         return log_and_format_error("list_chats", e, chat_type=chat_type, limit=limit)
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+async def get_active_chats(
+    from_date: str = None,
+    to_date: str = None,
+    chat_type: str = None,
+    limit: int = 50,
+) -> str:
+    """
+    Get chats that had activity within a specified date range.
+
+    Args:
+        from_date: Filter chats with activity starting from this date (format: YYYY-MM-DD).
+                   Defaults to yesterday.
+        to_date: Filter chats with activity until this date (format: YYYY-MM-DD).
+                 Defaults to today.
+        chat_type: Filter by chat type ('user', 'group', 'channel', or None for all).
+        limit: Maximum number of chats to retrieve (default: 50).
+    """
+    try:
+        # Parse date filters
+        try:
+            from datetime import timezone
+
+            utc = timezone.utc
+        except ImportError:
+            utc = datetime.timezone.utc
+
+        if from_date:
+            try:
+                from_date_obj = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=utc)
+            except ValueError:
+                return "Invalid from_date format. Use YYYY-MM-DD."
+        else:
+            # Default to yesterday
+            from_date_obj = (datetime.now(utc) - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+
+        if to_date:
+            try:
+                to_date_obj = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=utc)
+                # Set to end of day
+                to_date_obj = to_date_obj + timedelta(days=1, microseconds=-1)
+            except ValueError:
+                return "Invalid to_date format. Use YYYY-MM-DD."
+        else:
+            # Default to end of today
+            to_date_obj = datetime.now(utc).replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+
+        dialogs = await client.get_dialogs(limit=limit * 2)  # Fetch more to account for filtering
+
+        results = []
+        for dialog in dialogs:
+            # Check if last message is within date range
+            if not dialog.message or not dialog.message.date:
+                continue
+
+            msg_date = dialog.message.date
+            if msg_date < from_date_obj or msg_date > to_date_obj:
+                continue
+
+            entity = dialog.entity
+
+            # Filter by type if requested
+            current_type = None
+            if isinstance(entity, User):
+                current_type = "user"
+            elif isinstance(entity, Chat):
+                current_type = "group"
+            elif isinstance(entity, Channel):
+                if getattr(entity, "broadcast", False):
+                    current_type = "channel"
+                else:
+                    current_type = "group"  # Supergroup
+
+            if chat_type and current_type != chat_type.lower():
+                continue
+
+            # Format chat info
+            chat_info = f"Chat ID: {entity.id}"
+
+            if hasattr(entity, "title"):
+                chat_info += f', Title: "{entity.title}"'
+            elif hasattr(entity, "first_name"):
+                name = f"{entity.first_name}"
+                if hasattr(entity, "last_name") and entity.last_name:
+                    name += f" {entity.last_name}"
+                chat_info += f', Name: "{name}"'
+
+            chat_info += f", Type: {current_type}"
+            chat_info += f"\nLast Activity: {msg_date.strftime('%Y-%m-%d %H:%M')}"
+
+            if dialog.unread_count > 0:
+                chat_info += f", Unread: {dialog.unread_count}"
+
+            results.append(chat_info)
+
+            if len(results) >= limit:
+                break
+
+        if not results:
+            return f"No chats found with activity between {from_date_obj.strftime('%Y-%m-%d')} and {to_date_obj.strftime('%Y-%m-%d')}."
+
+        return "\n\n".join(results)
+    except Exception as e:
+        return log_and_format_error("get_active_chats", e, from_date=from_date, to_date=to_date)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
@@ -2580,6 +2909,43 @@ async def search_public_chats(query: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@validate_id("channel")
+async def get_channel_recommendations(channel: Union[int, str]) -> str:
+    """
+    Get recommended/similar channels for a given channel.
+
+    Args:
+        channel: The ID or username of the channel to get recommendations for.
+    """
+    try:
+        entity = await client.get_entity(channel)
+        if not isinstance(entity, Channel) or not getattr(entity, "broadcast", False):
+            return "This function only works with broadcast channels, not groups or users."
+
+        result = await client(functions.channels.GetChannelRecommendationsRequest(channel=entity))
+
+        channels = []
+        for chat in result.chats:
+            channels.append(
+                {
+                    "id": chat.id,
+                    "title": getattr(chat, "title", "Unknown"),
+                    "username": getattr(chat, "username", None),
+                    "participants_count": getattr(chat, "participants_count", None),
+                }
+            )
+
+        if not channels:
+            return f"No recommendations found for this channel."
+
+        return json.dumps(channels, indent=2, default=json_serializer)
+    except telethon.errors.rpcerrorlist.ChannelPrivateError:
+        return "Cannot get recommendations: channel is private or inaccessible."
+    except Exception as e:
+        return log_and_format_error("get_channel_recommendations", e, channel=channel)
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
@@ -3133,21 +3499,79 @@ if __name__ == "__main__":
     nest_asyncio.apply()
 
     async def main() -> None:
+        # If configuration is missing, still run the MCP server
+        # Tools will return helpful error messages via get_status() or log_and_format_error()
+        if _config_error is not None:
+            print(
+                f"Running MCP server in unconfigured mode: {_config_error}",
+                file=sys.stderr,
+            )
+            await mcp.run_stdio_async()
+            return
+
         try:
             # Start the Telethon client non-interactively
-            print("Starting Telegram client...")
-            await client.start()
+            print("Starting Telegram client...", file=sys.stderr)
+            await client.connect()
 
-            print("Telegram client started. Running MCP server...")
-            # Use the asynchronous entrypoint instead of mcp.run()
-            await mcp.run_stdio_async()
-        except Exception as e:
-            print(f"Error starting client: {e}", file=sys.stderr)
-            if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
+            # Check if user is authorized
+            if not await client.is_user_authorized():
                 print(
-                    "Database lock detected. Please ensure no other instances are running.",
+                    "\n" + "=" * 60,
                     file=sys.stderr,
                 )
+                print("ERROR: Telegram session expired or invalid!", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+                print("\nYour session is no longer valid.", file=sys.stderr)
+                print("This can happen if:", file=sys.stderr)
+                print("  - You changed your Telegram password", file=sys.stderr)
+                print("  - The session was revoked in Telegram settings", file=sys.stderr)
+                print("  - The session string is corrupted", file=sys.stderr)
+                print("\nTo fix this:", file=sys.stderr)
+                print("1. Run: uv run session_string_generator.py", file=sys.stderr)
+                print("2. Update TELEGRAM_SESSION_STRING in your .env file", file=sys.stderr)
+                print("=" * 60 + "\n", file=sys.stderr)
+                await client.disconnect()
+                sys.exit(1)
+
+            print("Telegram client authorized. Running MCP server...", file=sys.stderr)
+            # Use the asynchronous entrypoint instead of mcp.run()
+            await mcp.run_stdio_async()
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                print(
+                    "\n" + "=" * 60,
+                    file=sys.stderr,
+                )
+                print("ERROR: Database is locked!", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+                print("\nAnother instance of telegram-mcp may be running.", file=sys.stderr)
+                print("\nTo fix this:", file=sys.stderr)
+                print("1. Close other instances of Claude/Cursor using this MCP", file=sys.stderr)
+                print(
+                    "2. Or use TELEGRAM_SESSION_STRING instead of file-based session",
+                    file=sys.stderr,
+                )
+                print("=" * 60 + "\n", file=sys.stderr)
+            else:
+                print(f"Database error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "auth" in error_str or "unauthorized" in error_str or "session" in error_str:
+                print(
+                    "\n" + "=" * 60,
+                    file=sys.stderr,
+                )
+                print("ERROR: Telegram authentication failed!", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+                print(f"\nDetails: {e}", file=sys.stderr)
+                print("\nTo fix this:", file=sys.stderr)
+                print("1. Run: uv run session_string_generator.py", file=sys.stderr)
+                print("2. Update TELEGRAM_SESSION_STRING in your .env file", file=sys.stderr)
+                print("=" * 60 + "\n", file=sys.stderr)
+            else:
+                print(f"Error starting client: {e}", file=sys.stderr)
             sys.exit(1)
 
     asyncio.run(main())
