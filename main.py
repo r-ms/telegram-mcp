@@ -1,7 +1,7 @@
 import os
 import sys
 import json
-import time
+import hashlib
 import asyncio
 import sqlite3
 import logging
@@ -122,6 +122,55 @@ def require_client(func):
         return await func(*args, **kwargs)
 
     return wrapper
+
+
+# In-memory cache for read-only MCP tools
+class CacheManager:
+    """In-memory cache with TTL support for MCP tool results."""
+
+    def __init__(self, default_ttl: int = 1800):  # 30 minutes
+        self._cache: Dict[str, tuple[Any, datetime]] = {}
+        self._default_ttl = default_ttl
+
+    def _make_key(self, func_name: str, args: tuple, kwargs: dict) -> str:
+        key_data = f"{func_name}:{args}:{sorted(kwargs.items())}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+
+    def get(self, key: str) -> Optional[Any]:
+        if key in self._cache:
+            value, expires = self._cache[key]
+            if datetime.now() < expires:
+                return value
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        expires = datetime.now() + timedelta(seconds=ttl or self._default_ttl)
+        self._cache[key] = (value, expires)
+
+
+_cache = CacheManager()
+
+
+def cached(ttl: Optional[int] = None):
+    """Cache decorator for read-only MCP tools."""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            key = _cache._make_key(func.__name__, args, kwargs)
+            result = _cache.get(key)
+            if result is not None:
+                return result
+            result = await func(*args, **kwargs)
+            # Don't cache errors
+            if not (isinstance(result, str) and "Error" in result):
+                _cache.set(key, result, ttl)
+            return result
+
+        return wrapper
+
+    return decorator
 
 
 # Setup robust logging with both file and console output
@@ -451,6 +500,7 @@ async def reconnect() -> dict:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
     Get a paginated list of chats.
@@ -477,6 +527,7 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
     """
@@ -548,6 +599,7 @@ async def subscribe_public_channel(channel: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def list_inline_buttons(
     chat_id: Union[int, str], message_id: Optional[Union[int, str]] = None, limit: int = 20
@@ -727,6 +779,7 @@ async def press_inline_button(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def list_contacts() -> str:
     """
     List all contacts in your Telegram account.
@@ -753,6 +806,7 @@ async def list_contacts() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def search_contacts(query: str) -> str:
     """
     Search for contacts by name, username, or phone number using Telethon's SearchRequest.
@@ -781,6 +835,7 @@ async def search_contacts(query: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_contact_ids() -> str:
     """
     Get all contact IDs in your Telegram account.
@@ -795,6 +850,7 @@ async def get_contact_ids() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id", "from_user")
 async def list_messages(
     chat_id: Union[int, str],
@@ -931,6 +987,7 @@ async def list_messages(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def search_global_messages(
     query: str,
     min_date: str = None,
@@ -1048,6 +1105,7 @@ async def search_global_messages(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def list_topics(
     chat_id: int,
     limit: int = 200,
@@ -1135,6 +1193,7 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def list_chats(chat_type: str = None, limit: int = 20) -> str:
     """
     List available chats with metadata.
@@ -1196,6 +1255,7 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_active_chats(
     from_date: str = None,
     to_date: str = None,
@@ -1306,6 +1366,7 @@ async def get_active_chats(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_chat(chat_id: Union[int, str]) -> str:
     """
@@ -1387,6 +1448,7 @@ async def get_chat(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_direct_chat_by_contact(contact_query: str) -> str:
     """
     Find a direct chat with a specific contact by name, username, or phone.
@@ -1442,6 +1504,7 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("contact_id")
 async def get_contact_chats(contact_id: Union[int, str]) -> str:
     """
@@ -1495,6 +1558,7 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("contact_id")
 async def get_last_interaction(contact_id: Union[int, str]) -> str:
     """
@@ -1532,6 +1596,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_message_context(
     chat_id: Union[int, str], message_id: int, context_size: int = 3
@@ -1711,6 +1776,7 @@ async def unblock_user(user_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_me() -> str:
     """
     Get your own user information.
@@ -1917,6 +1983,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_participants(chat_id: Union[int, str]) -> str:
     """
@@ -2048,6 +2115,7 @@ async def delete_profile_photo() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_privacy_settings() -> str:
     """
     Get your privacy settings for last seen status.
@@ -2192,6 +2260,7 @@ async def import_contacts(contacts: list) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def export_contacts() -> str:
     """
     Export all contacts as a JSON string.
@@ -2205,6 +2274,7 @@ async def export_contacts() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_blocked_users() -> str:
     """
     Get a list of blocked users.
@@ -2540,6 +2610,7 @@ async def unban_user(chat_id: Union[int, str], user_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_admins(chat_id: Union[int, str]) -> str:
     """
@@ -2559,6 +2630,7 @@ async def get_admins(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_banned_users(chat_id: Union[int, str]) -> str:
     """
@@ -2580,6 +2652,7 @@ async def get_banned_users(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_invite_link(chat_id: Union[int, str]) -> str:
     """
@@ -2919,6 +2992,7 @@ async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
     """
@@ -2941,6 +3015,7 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def search_public_chats(query: str) -> str:
     """
     Search for public chats, channels, or bots by username or title.
@@ -2953,6 +3028,7 @@ async def search_public_chats(query: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("channel")
 async def get_channel_recommendations(channel: Union[int, str]) -> str:
     """
@@ -2990,6 +3066,7 @@ async def get_channel_recommendations(channel: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
@@ -3016,6 +3093,7 @@ async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20)
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def resolve_username(username: str) -> str:
     """
     Resolve a username to a user or chat ID.
@@ -3148,6 +3226,7 @@ async def unarchive_chat(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_sticker_sets() -> str:
     """
     Get all sticker sets.
@@ -3185,6 +3264,7 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_gif_search(query: str, limit: int = 10) -> str:
     """
     Search for GIFs by query. Returns a list of Telegram document IDs (not file paths).
@@ -3261,6 +3341,7 @@ async def send_gif(chat_id: Union[int, str], gif_id: int) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 async def get_bot_info(bot_username: str) -> str:
     """
     Get information about a bot by username.
@@ -3346,6 +3427,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
@@ -3370,6 +3452,7 @@ async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("user_id")
 async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
     """
@@ -3386,6 +3469,7 @@ async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("user_id")
 async def get_user_status(user_id: Union[int, str]) -> str:
     """
@@ -3399,6 +3483,7 @@ async def get_user_status(user_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_recent_actions(chat_id: Union[int, str]) -> str:
     """
@@ -3428,6 +3513,7 @@ async def get_recent_actions(chat_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@cached()
 @validate_id("chat_id")
 async def get_pinned_messages(chat_id: Union[int, str]) -> str:
     """
