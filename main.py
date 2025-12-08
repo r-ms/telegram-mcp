@@ -406,6 +406,50 @@ async def get_status() -> dict:
     return status
 
 
+@mcp.tool(annotations=ToolAnnotations(idempotentHint=True))
+async def reconnect() -> dict:
+    """
+    Reconnect the Telegram client. Use this if the connection is lost or becomes unresponsive.
+    """
+    if client is None:
+        return {
+            "success": False,
+            "error": _config_error or "Telegram client not initialized",
+        }
+
+    try:
+        # Disconnect if currently connected
+        if client.is_connected():
+            await client.disconnect()
+
+        # Reconnect
+        await client.connect()
+
+        # Check authorization
+        if not await client.is_user_authorized():
+            return {
+                "success": False,
+                "error": "Session expired or invalid. Please regenerate session string.",
+            }
+
+        # Get user info to confirm connection
+        me = await client.get_me()
+        return {
+            "success": True,
+            "message": "Reconnected successfully",
+            "user": {
+                "id": me.id,
+                "username": me.username,
+                "first_name": me.first_name,
+            },
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Reconnection failed: {str(e)}",
+        }
+
+
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
