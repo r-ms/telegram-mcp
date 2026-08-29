@@ -110,8 +110,49 @@ if _config_error is None:
         client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 
+async def _ensure_connected() -> Optional[str]:
+    """Ensure client is connected, auto-reconnect if needed. Returns error string or None."""
+    if client is None:
+        return _config_error or "Telegram client not initialized"
+
+    if not client.is_connected():
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return "Session expired or invalid. Please regenerate session string."
+        except Exception as e:
+            return f"Auto-reconnect failed: {str(e)}"
+
+    return None
+
+
+# Monkey-patch mcp.tool to add auto-reconnect to all tools
+_original_mcp_tool = mcp.tool
+
+
+def _auto_reconnect_tool(*tool_args, **tool_kwargs):
+    """Wrapper for mcp.tool that adds auto-reconnect logic to all tools."""
+    original_decorator = _original_mcp_tool(*tool_args, **tool_kwargs)
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Auto-reconnect before executing tool
+            conn_error = await _ensure_connected()
+            if conn_error:
+                return f"Connection error: {conn_error}"
+            return await func(*args, **kwargs)
+
+        return original_decorator(wrapper)
+
+    return decorator
+
+
+mcp.tool = _auto_reconnect_tool
+
+
 def require_client(func):
-    """Decorator to check if client is configured before running a tool."""
+    """Decorator to check if client is configured and connected before running a tool."""
 
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -119,6 +160,12 @@ def require_client(func):
             return {"error": _config_error, "configured": False}
         if client is None:
             return {"error": "Telegram client not initialized", "configured": False}
+
+        # Auto-reconnect if disconnected
+        conn_error = await _ensure_connected()
+        if conn_error:
+            return {"error": conn_error, "connected": False}
+
         return await func(*args, **kwargs)
 
     return wrapper
