@@ -102,6 +102,26 @@ if _config_error is None and not SESSION_STRING and not TELEGRAM_SESSION_NAME:
 
 mcp = FastMCP("telegram")
 
+# --- SAFETY: read-only mode (oksana CRM) ---------------------------------
+# This server runs on Oksana's PERSONAL Telegram account and is driven by an
+# LLM. We refuse to register any tool flagged destructiveHint=True (send /
+# delete / ban / leave / edit / mute / forward / profile changes / ...), so the
+# ~42 mutating tools are never exposed over MCP. Only the read tools (and
+# reconnect) remain. Set TELEGRAM_ALLOW_WRITE=1 to deliberately re-enable them.
+if os.getenv("TELEGRAM_ALLOW_WRITE", "").strip() not in ("1", "true", "yes"):
+    _orig_tool = mcp.tool
+
+    def _readonly_tool(*d_args, **d_kwargs):
+        ann = d_kwargs.get("annotations")
+        if ann is not None and getattr(ann, "destructiveHint", False):
+            def _skip(func):
+                return func  # not registered as an MCP tool
+            return _skip
+        return _orig_tool(*d_args, **d_kwargs)
+
+    mcp.tool = _readonly_tool
+# -------------------------------------------------------------------------
+
 # Only create client if configuration is valid
 if _config_error is None:
     if SESSION_STRING:
@@ -3623,6 +3643,80 @@ async def create_poll(
         return log_and_format_error(
             "create_poll", e, chat_id=chat_id, question=question, options=options
         )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def crm_scan_candidates(days: int = 30, msgs: int = 12, max_dialogs: int = 600) -> dict:
+    """CRM bulk scan: active PERSONAL dialogs within the last `days`, with the last
+    `msgs` messages each and mechanical signals already computed. One call instead of
+    hundreds of round-trips. Read-only.
+
+    Filters out bots and the Telegram service account (id 777000); only 1-to-1 user
+    dialogs are returned. Dialogs are newest-first; scanning stops past the window.
+
+    Returns: {"days", "count", "scanned_at", "dialogs": [{
+        id, name, username, is_contact, unread, last_date, age_days,
+        last_dir ("in"=peer wrote last / "out"=we wrote last),
+        msgs: [{out, date, text}]  # chronological, text truncated to 300 chars
+    }]}. On failure: {"error": "..."}.
+    """
+    from datetime import datetime, timezone
+
+    if _config_error is not None:
+        return {"error": _config_error, "configured": False}
+    try:
+        now = datetime.now(timezone.utc)
+        out = []
+        old_streak = 0  # допуск: выходим только после серии старых подряд,
+        async for d in client.iter_dialogs(limit=None):  # чтобы pinned старый
+            if not d.is_user:                            # сверху не оборвал скан
+                continue
+            if d.date is None:
+                continue
+            age = (now - d.date).days
+            if age > days:
+                if getattr(d, "pinned", False):
+                    continue  # закреплённый старый — пропускаем, не считаем
+                old_streak += 1
+                if old_streak >= 15:
+                    break  # уверенно вышли за окно (порядок ~ по убыванию даты)
+                continue
+            old_streak = 0
+            ent = d.entity
+            if getattr(ent, "bot", False):
+                continue
+            if getattr(ent, "is_self", False) or d.id == 777000:
+                continue
+            conv = []
+            async for m in client.iter_messages(d.id, limit=msgs):
+                t = (m.message or "").strip()
+                if not t and m.media:
+                    t = "[media]"
+                conv.append({
+                    "out": bool(m.out),
+                    "date": m.date.isoformat() if m.date else None,
+                    "text": t[:300],
+                })
+            conv.reverse()  # chronological
+            last_dir = "out" if (conv and conv[-1]["out"]) else "in"
+            name = ((getattr(ent, "first_name", "") or "")
+                    + (" " + getattr(ent, "last_name", "") if getattr(ent, "last_name", None) else "")).strip()
+            out.append({
+                "id": d.id,
+                "name": name,
+                "username": getattr(ent, "username", None),
+                "is_contact": bool(getattr(ent, "contact", False)),
+                "unread": d.unread_count,
+                "last_date": d.date.isoformat(),
+                "age_days": age,
+                "last_dir": last_dir,
+                "msgs": conv,
+            })
+            if len(out) >= max_dialogs:
+                break
+        return {"days": days, "count": len(out), "scanned_at": now.isoformat(), "dialogs": out}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 if __name__ == "__main__":
